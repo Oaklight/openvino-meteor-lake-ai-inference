@@ -48,6 +48,38 @@ Single: 67.6 samples/s (14.8 ms)
 Batch16: 245.4 samples/s (65.2 ms/batch)
 ```
 
+## Reranker: BGE Reranker v2 M3 FP16 (pre-converted)
+
+Model: `J-Parker/bge-reranker-v2-m3-openvino`
+
+```
+--- CPU ---
+Model loaded in 70.1s
+Single: 6.9 pairs/s (143.9 ms)
+Batch 16: 6.4 pairs/s (2509.8 ms/batch)
+
+--- GPU ---
+Model loaded in 7.5s
+Single: 27.4 pairs/s (36.5 ms)
+Batch 16: 41.8 pairs/s (382.7 ms/batch)
+```
+
+## Reranker: BGE Reranker v2 M3 INT8 (pre-converted)
+
+Model: `stellars/bge-reranker-v2-m3-openvino-int8`
+
+```
+--- CPU ---
+Model loaded in 29.6s
+Single: 16.6 pairs/s (60.1 ms)
+Batch 16: 19.2 pairs/s (833.9 ms/batch)
+
+--- GPU ---
+Model loaded in 7.6s
+Single: 33.0 pairs/s (30.3 ms)
+Batch 16: 43.5 pairs/s (367.9 ms/batch)
+```
+
 ## LLM: Qwen3 8B — llama.cpp SYCL
 
 Model: `Qwen3-8B-Q4_K_M.gguf` (4.68 GiB)
@@ -59,6 +91,20 @@ Model: `Qwen3-8B-Q4_K_M.gguf` (4.68 GiB)
 | qwen3 8B Q4_K - Medium         |   4.68 GiB |     8.19 B | SYCL       |  99 |   none |           tg128 |          6.87 ± 1.77 |
 | qwen3 8B Q4_K - Medium         |   4.68 GiB |     8.19 B | SYCL       |   0 |   none |           pp512 |         88.48 ± 6.53 |
 | qwen3 8B Q4_K - Medium         |   4.68 GiB |     8.19 B | SYCL       |   0 |   none |           tg128 |          3.86 ± 0.81 |
+```
+
+## LLM: Qwen3 8B — llama.cpp OpenVINO backend
+
+Model: `Qwen3-8B-Q4_K_M.gguf` (4.68 GiB)
+
+```
+# CPU
+| model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --: | --------------: | -------------------: |
+| qwen3 8B Q4_K - Medium         |   4.68 GiB |     8.19 B | OPENVINO   |  -1 |   1 |           pp512 |        34.46 ± 11.08 |
+| qwen3 8B Q4_K - Medium         |   4.68 GiB |     8.19 B | OPENVINO   |  -1 |   1 |           tg128 |          5.29 ± 1.69 |
+
+# GPU — CRASHED: CL_OUT_OF_RESOURCES (iGPU shared memory insufficient for 8B model)
 ```
 
 ## LLM: Qwen3 8B — OpenVINO GenAI

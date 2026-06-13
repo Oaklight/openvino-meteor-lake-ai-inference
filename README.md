@@ -30,30 +30,49 @@ Benchmarks and setup scripts for running AI inference workloads on Intel Meteor 
 
 **Best**: INT8 GPU batch (245 samples/s) for throughput, INT8 CPU (83 samples/s, 12ms) for latency.
 
+### Reranker: BGE Reranker v2 M3 (568M params)
+
+| Configuration | Single (pairs/s) | Batch 16 (pairs/s) |
+|---------------|------------------:|-------------------:|
+| FP16 CPU | 6.9 | 6.4 |
+| **FP16 GPU** | **27.4** | 41.8 |
+| INT8 CPU | 16.6 | 19.2 |
+| **INT8 GPU** | **33.0** | **43.5** |
+
+**Best**: INT8 GPU (33 pairs/s single, 44 pairs/s batch). GPU dominates for reranking — 4-5x faster than CPU.
+
 ### LLM Generation: Qwen3 8B
 
-| Backend | Quantization | Prompt (tok/s) | Generation (tok/s) |
-|---------|-------------|---------------:|-------------------:|
-| llama.cpp SYCL GPU | Q4_K_M | 70.2 | 6.9 |
-| llama.cpp SYCL CPU | Q4_K_M | 88.5 | 3.9 |
-| **OpenVINO GenAI CPU** | **INT4** | — | **8.5** |
-| OpenVINO GenAI GPU | INT4 | — | 7.2 |
+Comparison using each framework's native model format:
 
-**Best**: OpenVINO GenAI CPU (8.5 tok/s) — faster than GPU for LLM generation on shared-memory iGPU.
+| Backend | Format | Quantization | Prompt (tok/s) | Generation (tok/s) |
+|---------|--------|-------------|---------------:|-------------------:|
+| llama.cpp SYCL GPU | GGUF | Q4_K_M | 70.2 | 6.9 |
+| llama.cpp SYCL CPU | GGUF | Q4_K_M | 88.5 | 3.9 |
+| llama.cpp OpenVINO CPU | GGUF | Q4_K_M | 34.5 | 5.3 |
+| llama.cpp OpenVINO GPU | GGUF | Q4_K_M | ❌ OOM | ❌ |
+| **OpenVINO GenAI CPU** | **OV IR** | **INT4** | — | **8.5** |
+| OpenVINO GenAI GPU | OV IR | INT4 | — | 7.2 |
+
+**Best**: OpenVINO GenAI CPU with native INT4 IR format (8.5 tok/s).
 
 ## Key Findings
 
-1. **Embedding/Reranker → OpenVINO INT8 GPU** is the clear winner. Batch processing at 245 samples/s makes it viable for production RAG pipelines on a laptop.
+1. **Embedding/Reranker → OpenVINO INT8 GPU** is the clear winner. Batch processing at 245 samples/s (embedding) and 44 pairs/s (reranker) makes it viable for production RAG pipelines on a laptop.
 
-2. **LLM generation → OpenVINO GenAI CPU** beats all other options. The iGPU doesn't help for autoregressive generation because CPU and GPU share the same memory bandwidth — CPU's larger L3 cache and VNNI instructions give it an edge.
+2. **LLM generation → OpenVINO GenAI CPU** beats all other options including llama.cpp SYCL. The iGPU doesn't help for autoregressive generation because CPU and GPU share the same memory bandwidth — CPU's larger L3 cache and VNNI instructions give it an edge.
 
-3. **INT8 quantization** provides 3-5x speedup on CPU thanks to Intel VNNI instructions, with negligible quality loss for embedding models.
+3. **INT8 quantization** provides 2-3x speedup on CPU thanks to Intel VNNI instructions, with negligible quality loss for embedding/reranker models.
 
-4. **llama.cpp SYCL** works but isn't the fastest path on Meteor Lake iGPU. It shines more on discrete Intel GPUs (Arc A770, Max 1550) where dedicated HBM provides higher bandwidth.
+4. **llama.cpp OpenVINO backend is immature** — GPU crashes with OOM on 8B models, CPU performance is worse than SYCL. The SYCL backend is the better llama.cpp option on Intel GPUs today.
+
+5. **Native format matters for LLMs** — OpenVINO GenAI with its own INT4 IR format (8.5 tok/s) outperforms llama.cpp SYCL with GGUF Q4_K_M (6.9 tok/s GPU, 3.9 tok/s CPU). Each framework performs best with its own optimized format.
+
+6. **Reranker is GPU-bound** — unlike LLM generation (memory-bandwidth bound), cross-encoder reranking benefits massively from GPU parallelism, even on a shared-memory iGPU.
 
 ## Quick Start
 
-### OpenVINO (Embedding + LLM)
+### OpenVINO (Embedding + Reranker + LLM)
 
 ```bash
 # 1. Install Intel GPU compute runtime
@@ -68,10 +87,9 @@ pip install openvino optimum[openvino] sentence-transformers openvino-genai
 python -c "from openvino import Core; c = Core(); print(c.available_devices)"
 # Expected: ['CPU', 'GPU']
 
-# 4. Run embedding benchmark
+# 4. Run benchmarks
 python scripts/bench-embedding.py
-
-# 5. Run LLM benchmark
+python scripts/bench-reranker.py
 python scripts/bench-llm-openvino.py
 ```
 
@@ -107,6 +125,7 @@ cmake --build build --config Release -j$(nproc)
 | [scripts/setup-openvino.sh](scripts/setup-openvino.sh) | Install GPU runtime + OpenVINO conda env |
 | [scripts/setup-llamacpp-sycl.sh](scripts/setup-llamacpp-sycl.sh) | Install oneAPI + build llama.cpp with SYCL |
 | [scripts/bench-embedding.py](scripts/bench-embedding.py) | Embedding model benchmark (OpenVINO) |
+| [scripts/bench-reranker.py](scripts/bench-reranker.py) | Reranker model benchmark (OpenVINO) |
 | [scripts/bench-llm-openvino.py](scripts/bench-llm-openvino.py) | LLM benchmark (OpenVINO GenAI) |
 | [scripts/bench-llm-llamacpp.sh](scripts/bench-llm-llamacpp.sh) | LLM benchmark (llama.cpp SYCL) |
 
@@ -115,7 +134,8 @@ cmake --build build --config Release -j$(nproc)
 | Model | HuggingFace Repo | Use Case |
 |-------|-----------------|----------|
 | BGE-M3 INT8 | [stellars/bge-m3-openvino-int8](https://huggingface.co/stellars/bge-m3-openvino-int8) | Embedding |
-| BGE Reranker v2 M3 | [J-Parker/bge-reranker-v2-m3-openvino](https://huggingface.co/J-Parker/bge-reranker-v2-m3-openvino) | Reranking |
+| BGE Reranker v2 M3 FP16 | [J-Parker/bge-reranker-v2-m3-openvino](https://huggingface.co/J-Parker/bge-reranker-v2-m3-openvino) | Reranking |
+| BGE Reranker v2 M3 INT8 | [stellars/bge-reranker-v2-m3-openvino-int8](https://huggingface.co/stellars/bge-reranker-v2-m3-openvino-int8) | Reranking |
 | Qwen3 Embedding 0.6B INT8 | [OpenVINO/Qwen3-Embedding-0.6B-int8-ov](https://huggingface.co/OpenVINO/Qwen3-Embedding-0.6B-int8-ov) | Embedding |
 | Qwen3 8B INT4 | [OpenVINO/Qwen3-8B-int4-ov](https://huggingface.co/OpenVINO/Qwen3-8B-int4-ov) | LLM |
 
