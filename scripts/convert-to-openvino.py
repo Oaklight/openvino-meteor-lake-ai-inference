@@ -49,6 +49,114 @@ def get_output_dir(model_id: str, weight_format: str, output: str | None) -> Pat
     return Path(f"{name}-{weight_format}")
 
 
+def _try_optimum_export(
+    model_id: str, weight_format: str, output_dir: Path, trust_remote_code: bool
+):
+    """Try converting with optimum-intel (handles DynamicCache, KV cache, etc.).
+
+    Args:
+        model_id: HuggingFace model ID or local path.
+        weight_format: Target weight format.
+        output_dir: Output directory.
+        trust_remote_code: Whether to trust remote code.
+
+    Returns:
+        True if optimum succeeded, None otherwise.
+    """
+    try:
+        from optimum.intel import OVModelForCausalLM
+
+        print(f"Trying optimum-intel export (weight_format={weight_format})...")
+        t0 = time.time()
+        ov_model = OVModelForCausalLM.from_pretrained(
+            model_id,
+            export=True,
+            trust_remote_code=trust_remote_code,
+        )
+        # Apply quantization via optimum's save
+        ov_model.save_pretrained(output_dir)
+        print(f"optimum-intel export done in {time.time() - t0:.1f}s")
+
+        # If weight format is int4/int8, need to compress after
+        if weight_format in ("int4", "int8"):
+            import nncf
+            import openvino as ov
+
+            print(f"Applying {weight_format} compression via NNCF...")
+            core = ov.Core()
+            model = core.read_model(output_dir / "openvino_model.xml")
+
+            if weight_format == "int4":
+                model = nncf.compress_weights(
+                    model,
+                    mode=nncf.CompressWeightsMode.INT4_ASYM,
+                    group_size=128,
+                )
+            else:
+                model = nncf.compress_weights(
+                    model,
+                    mode=nncf.CompressWeightsMode.INT8_SYM,
+                )
+            ov.save_model(model, output_dir / "openvino_model.xml")
+            print(f"NNCF {weight_format} compression done")
+
+        return True
+    except Exception as e:
+        print(f"optimum-intel failed: {e}")
+        return None
+
+
+def _write_metadata(
+    output_dir: Path,
+    model_id: str,
+    weight_format: str,
+    group_size: int,
+    dtype: str,
+    converter: str,
+):
+    """Write conversion metadata to output directory.
+
+    Args:
+        output_dir: Output directory.
+        model_id: Source model ID.
+        weight_format: Weight format used.
+        group_size: Group size for INT4.
+        dtype: Torch dtype used.
+        converter: Name of the converter used.
+    """
+    import nncf
+    import openvino as ov
+
+    metadata = {
+        "source_model": model_id,
+        "weight_format": weight_format,
+        "group_size": group_size if weight_format == "int4" else None,
+        "converter": converter,
+        "openvino_version": ov.__version__,
+        "nncf_version": nncf.__version__,
+        "torch_dtype": dtype,
+    }
+    with open(output_dir / "conversion_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def _verify_output(output_dir: Path):
+    """Verify the conversion output files exist.
+
+    Args:
+        output_dir: Output directory to check.
+    """
+    model_file = output_dir / "openvino_model.xml"
+    bin_file = output_dir / "openvino_model.bin"
+    if model_file.exists() and bin_file.exists():
+        bin_size = bin_file.stat().st_size / (1024**3)
+        print(f"\nSuccess! Output: {output_dir}")
+        print(f"  openvino_model.xml + .bin ({bin_size:.2f} GB)")
+    else:
+        print(f"\nError: expected files not found in {output_dir}")
+        sys.exit(1)
+
+
 def copy_tokenizer_files(model_id: str, output_dir: Path, trust_remote_code: bool):
     """Save tokenizer and config files to the output directory.
 
@@ -106,6 +214,23 @@ def convert_model(
     }
     torch_dtype = torch_dtype_map.get(dtype, "auto")
 
+    # Try optimum-intel first (handles DynamicCache, KV cache, etc.)
+    ov_model = _try_optimum_export(
+        model_id, weight_format, output_dir, trust_remote_code
+    )
+
+    if ov_model is not None:
+        # optimum handled everything including quantization and saving
+        copy_tokenizer_files(model_id, output_dir, trust_remote_code)
+        _write_metadata(
+            output_dir, model_id, weight_format, group_size, dtype, "optimum-intel"
+        )
+        _verify_output(output_dir)
+        return
+
+    # Fallback: direct ov.convert_model + NNCF
+    print("optimum-intel failed, falling back to ov.convert_model + NNCF...")
+
     # Load tokenizer for example input
     print(f"Loading tokenizer from {model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -127,22 +252,26 @@ def convert_model(
     # Prepare example input for tracing
     example_text = "Hello, how are you?"
     example_input = tokenizer(example_text, return_tensors="pt")
-    # Only keep input_ids and attention_mask
     example_input = {
         "input_ids": example_input["input_ids"],
         "attention_mask": example_input["attention_mask"],
     }
 
-    # Convert to OpenVINO
+    # Convert to OpenVINO — try with example_input first, fallback without
     print("Converting to OpenVINO IR...")
     t0 = time.time()
-    ov_model = ov.convert_model(model, example_input=example_input)
+    try:
+        ov_model = ov.convert_model(model, example_input=example_input)
+    except Exception as e:
+        print(f"Tracing with example_input failed ({e}), trying without...")
+        ov_model = ov.convert_model(model)
     print(f"Conversion done in {time.time() - t0:.1f}s")
 
     # Free PyTorch model memory
     del model
     gc.collect()
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Apply weight compression if needed
     if weight_format == "fp16":
@@ -175,29 +304,15 @@ def convert_model(
     # Save tokenizer and config
     copy_tokenizer_files(model_id, output_dir, trust_remote_code)
 
-    # Write conversion metadata
-    metadata = {
-        "source_model": model_id,
-        "weight_format": weight_format,
-        "group_size": group_size if weight_format == "int4" else None,
-        "converter": "convert-to-openvino.py (openvino.convert_model + NNCF)",
-        "openvino_version": ov.__version__,
-        "nncf_version": nncf.__version__,
-        "torch_dtype": dtype,
-    }
-    with open(output_dir / "conversion_metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    # Verify output
-    model_file = output_dir / "openvino_model.xml"
-    bin_file = output_dir / "openvino_model.bin"
-    if model_file.exists() and bin_file.exists():
-        bin_size = bin_file.stat().st_size / (1024**3)
-        print(f"\nSuccess! Output: {output_dir}")
-        print(f"  openvino_model.xml + .bin ({bin_size:.2f} GB)")
-    else:
-        print(f"\nError: expected files not found in {output_dir}")
-        sys.exit(1)
+    _write_metadata(
+        output_dir,
+        model_id,
+        weight_format,
+        group_size,
+        dtype,
+        "ov.convert_model + NNCF",
+    )
+    _verify_output(output_dir)
 
 
 def main():
